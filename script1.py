@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+"""Backend SOC multi-client avec collecte Wazuh et analyse Ollama locale."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import sqlite3
+import ssl
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Generator
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import Request, urlopen
+
+
+LOG = logging.getLogger("soc-backend")
+MAX_REQUEST_BYTES = 1_000_000
+DEFAULT_DB_PATH = "soc.db"
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat(timespec="seconds")
+
+
+def parse_json_env(name: str, default: Any) -> Any:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} doit contenir du JSON valide: {exc}") from exc
+
+
+def json_response(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
+    """Convertit les champs Wazuh les plus courants en événement SOC stable."""
+    rule = alert.get("rule") if isinstance(alert.get("rule"), dict) else {}
+    agent = alert.get("agent") if isinstance(alert.get("agent"), dict) else {}
+    data = alert.get("data") if isinstance(alert.get("data"), dict) else {}
+    source_ip = data.get("srcip") or data.get("src_ip") or alert.get("srcip")
+    dest_ip = data.get("dstip") or data.get("dst_ip") or alert.get("dstip")
+    timestamp = alert.get("timestamp") or alert.get("@timestamp") or iso_now()
+
+    return {
+        "wazuh_id": str(alert.get("id") or alert.get("_id") or ""),
+        "timestamp": str(timestamp),
+        "rule_id": str(rule.get("id") or alert.get("rule_id") or "unknown"),
+        "rule_level": max(0, min(15, safe_int(rule.get("level", alert.get("level")), 0))),
+        "description": str(rule.get("description") or alert.get("description") or "Aucune description"),
+        "agent_id": str(agent.get("id") or alert.get("agent_id") or ""),
+        "agent_name": str(agent.get("name") or alert.get("agent_name") or "inconnu"),
+        "source_ip": str(source_ip or ""),
+        "dest_ip": str(dest_ip or ""),
+        "location": str(alert.get("location") or ""),
+        "raw": alert,
+    }
+
+
+def risk_score(rule_level: int, occurrences: int, rule_id: str) -> int:
+    """Score déterministe sur 100, combinant sévérité et répétition."""
+    repeat_bonus = min(25, max(0, occurrences - 1) * 5)
+    critical_rule_bonus = 10 if rule_id in {"5710", "5720", "1002"} else 0
+    return min(100, max(0, rule_level * 6 + repeat_bonus + critical_rule_bonus))
+
+
+def severity_for(score: int) -> str:
+    if score >= 80:
+        return "critical"
+    if score >= 60:
+        return "high"
+    if score >= 35:
+        return "medium"
+    return "low"
+
+
+class SocBackend:
+    def __init__(
+        self,
+        database_path: str,
+        tenants: dict[str, str],
+        notification_webhooks: dict[str, str],
+        ollama_url: str,
+        ollama_model: str,
+    ) -> None:
+        if not tenants or any(not token or not tenant for token, tenant in tenants.items()):
+            raise RuntimeError("Configurez SOC_TENANTS_JSON avec des jetons et identifiants clients.")
+        self.database_path = database_path
+        self.tenants = tenants
+        self.notification_webhooks = notification_webhooks
+        self.ollama_url = ollama_url.rstrip("/")
+        self.ollama_model = ollama_model
+        self._initialize_database()
+
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _initialize_database(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    dedup_key TEXT NOT NULL,
+                    wazuh_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    rule_id TEXT NOT NULL,
+                    rule_level INTEGER NOT NULL,
+                    description TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    dest_ip TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE (tenant_id, dedup_key)
+                );
+                CREATE INDEX IF NOT EXISTS alerts_tenant_last_seen
+                    ON alerts (tenant_id, last_seen DESC);
+                CREATE TABLE IF NOT EXISTS incidents (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    severity TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    feedback TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS incidents_tenant_updated
+                    ON incidents (tenant_id, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS incident_alerts (
+                    incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+                    alert_id TEXT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+                    PRIMARY KEY (incident_id, alert_id)
+                );
+                CREATE TABLE IF NOT EXISTS incident_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    incident_id TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS memory_tenant_created
+                    ON incident_memory (tenant_id, created_at DESC);
+                """
+            )
+
+    def tenant_for_token(self, token: str) -> str | None:
+        token_bytes = token.encode("utf-8")
+        for configured_token, tenant_id in self.tenants.items():
+            if hmac.compare_digest(token_bytes, configured_token.encode("utf-8")):
+                return tenant_id
+        return None
+
+    def _dedup_key(self, tenant_id: str, event: dict[str, Any]) -> str:
+        try:
+            event_time = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
+        except ValueError:
+            event_time = utc_now()
+        bucket = int(event_time.timestamp() // 600)
+        parts = (
+            tenant_id,
+            event["rule_id"],
+            event["agent_id"],
+            event["source_ip"],
+            event["dest_ip"],
+            event["description"],
+            str(bucket),
+        )
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+    def ingest_alert(self, tenant_id: str, raw_alert: dict[str, Any]) -> dict[str, Any]:
+        event = normalize_alert(raw_alert)
+        now = iso_now()
+        dedup_key = self._dedup_key(tenant_id, event)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM alerts WHERE tenant_id = ? AND dedup_key = ?",
+                (tenant_id, dedup_key),
+            ).fetchone()
+            if existing:
+                alert_id = existing["id"]
+                connection.execute(
+                    """UPDATE alerts SET occurrences = occurrences + 1, last_seen = ?,
+                       raw_json = ? WHERE id = ? AND tenant_id = ?""",
+                    (now, json.dumps(raw_alert, ensure_ascii=False), alert_id, tenant_id),
+                )
+                linked_incident = connection.execute(
+                    """SELECT i.id FROM incidents i
+                       JOIN incident_alerts ia ON ia.incident_id = i.id
+                       WHERE ia.alert_id = ? AND i.tenant_id = ?""",
+                    (alert_id, tenant_id),
+                ).fetchone()
+                if linked_incident:
+                    counts = connection.execute(
+                        """SELECT COALESCE(SUM(a.occurrences), 0) AS total,
+                                  MAX(a.rule_level) AS level
+                           FROM incident_alerts ia JOIN alerts a ON a.id = ia.alert_id
+                           WHERE ia.incident_id = ?""",
+                        (linked_incident["id"],),
+                    ).fetchone()
+                    score = risk_score(counts["level"] or 0, counts["total"], event["rule_id"])
+                    connection.execute(
+                        """UPDATE incidents SET score = ?, severity = ?, updated_at = ?
+                           WHERE id = ? AND tenant_id = ?""",
+                        (
+                            score, severity_for(score), now,
+                            linked_incident["id"], tenant_id,
+                        ),
+                    )
+            else:
+                alert_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO alerts
+                       (id, tenant_id, dedup_key, wazuh_id, timestamp, rule_id, rule_level,
+                        description, agent_id, agent_name, source_ip, dest_ip, location,
+                        raw_json, first_seen, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        alert_id, tenant_id, dedup_key, event["wazuh_id"], event["timestamp"],
+                        event["rule_id"], event["rule_level"], event["description"],
+                        event["agent_id"], event["agent_name"], event["source_ip"],
+                        event["dest_ip"], event["location"],
+                        json.dumps(raw_alert, ensure_ascii=False), now, now,
+                    ),
+                )
+                self._correlate_alert(connection, tenant_id, alert_id, event, 1)
+
+            alert_row = connection.execute(
+                "SELECT * FROM alerts WHERE id = ? AND tenant_id = ?", (alert_id, tenant_id)
+            ).fetchone()
+            incident_row = connection.execute(
+                """SELECT i.* FROM incidents i JOIN incident_alerts ia ON ia.incident_id = i.id
+                   WHERE ia.alert_id = ? AND i.tenant_id = ?""",
+                (alert_id, tenant_id),
+            ).fetchone()
+            return {
+                "alert": self._alert_json(alert_row),
+                "incident": self._incident_json(incident_row) if incident_row else None,
+                "created": existing is None,
+            }
+
+    def _correlate_alert(
+        self,
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        alert_id: str,
+        event: dict[str, Any],
+        occurrences: int,
+    ) -> None:
+        cutoff = (utc_now() - timedelta(minutes=30)).isoformat(timespec="seconds")
+        related = connection.execute(
+            """SELECT DISTINCT i.* FROM incidents i
+               JOIN incident_alerts ia ON ia.incident_id = i.id
+               JOIN alerts a ON a.id = ia.alert_id
+               WHERE i.tenant_id = ? AND i.status != 'resolved' AND i.updated_at >= ?
+               AND ((? != '' AND a.agent_id = ?) OR (? != '' AND a.source_ip = ?))
+               ORDER BY i.updated_at DESC LIMIT 1""",
+            (
+                tenant_id, cutoff, event["agent_id"], event["agent_id"],
+                event["source_ip"], event["source_ip"],
+            ),
+        ).fetchone()
+        score = risk_score(event["rule_level"], occurrences, event["rule_id"])
+        now = iso_now()
+
+        if related:
+            incident_id = related["id"]
+            connection.execute(
+                "INSERT OR IGNORE INTO incident_alerts (incident_id, alert_id) VALUES (?, ?)",
+                (incident_id, alert_id),
+            )
+            counts = connection.execute(
+                """SELECT COALESCE(SUM(a.occurrences), 0) AS total, MAX(a.rule_level) AS level
+                   FROM incident_alerts ia JOIN alerts a ON a.id = ia.alert_id
+                   WHERE ia.incident_id = ?""",
+                (incident_id,),
+            ).fetchone()
+            score = risk_score(counts["level"] or 0, counts["total"], event["rule_id"])
+            connection.execute(
+                """UPDATE incidents SET score = ?, severity = ?, updated_at = ?
+                   WHERE id = ? AND tenant_id = ?""",
+                (score, severity_for(score), now, incident_id, tenant_id),
+            )
+            connection.execute(
+                """INSERT INTO incident_memory
+                   (tenant_id, incident_id, memory_type, content, created_at)
+                   VALUES (?, ?, 'correlation', ?, ?)""",
+                (tenant_id, incident_id, f"Alerte liée par agent/IP: {event['agent_name']}", now),
+            )
+            return
+
+        incident_id = str(uuid.uuid4())
+        title = f"{event['description'][:140]} ({event['agent_name']})"
+        connection.execute(
+            """INSERT INTO incidents
+               (id, tenant_id, title, description, status, score, severity, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+            (
+                incident_id, tenant_id, title, event["description"], score,
+                severity_for(score), now, now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO incident_alerts (incident_id, alert_id) VALUES (?, ?)",
+            (incident_id, alert_id),
+        )
+        connection.execute(
+            """INSERT INTO incident_memory
+               (tenant_id, incident_id, memory_type, content, created_at)
+               VALUES (?, ?, 'created', ?, ?)""",
+            (tenant_id, incident_id, "Incident créé depuis une alerte Wazuh", now),
+        )
+        connection.execute(
+            """INSERT INTO incident_memory
+               (tenant_id, incident_id, memory_type, content, created_at)
+               VALUES (?, ?, 'score', ?, ?)""",
+            (tenant_id, incident_id, f"Score initial: {score}/100", now),
+        )
+        connection.execute(
+            """INSERT INTO incident_memory
+               (tenant_id, incident_id, memory_type, content, created_at)
+               VALUES (?, ?, 'notification', ?, ?)""",
+            (tenant_id, incident_id, "Notification d'incident à envoyer", now),
+        )
+        threading.Thread(
+            target=self._notify_incident,
+            args=(tenant_id, incident_id, title, score),
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _alert_json(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["raw"] = json.loads(value.pop("raw_json"))
+        return value
+
+    @staticmethod
+    def _incident_json(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def list_alerts(self, tenant_id: str, limit: int, since: str | None = None) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+        query = "SELECT * FROM alerts WHERE tenant_id = ?"
+        params: list[Any] = [tenant_id]
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+        query += " ORDER BY last_seen DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as connection:
+            return [self._alert_json(row) for row in connection.execute(query, params)]
+
+    def list_incidents(
+        self, tenant_id: str, status: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+        query = "SELECT * FROM incidents WHERE tenant_id = ?"
+        params: list[Any] = [tenant_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as connection:
+            return [self._incident_json(row) for row in connection.execute(query, params)]
+
+    def incident_detail(self, tenant_id: str, incident_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            incident = connection.execute(
+                "SELECT * FROM incidents WHERE id = ? AND tenant_id = ?",
+                (incident_id, tenant_id),
+            ).fetchone()
+            if not incident:
+                return None
+            alerts = connection.execute(
+                """SELECT a.id, a.wazuh_id, a.timestamp, a.rule_id, a.rule_level, a.description,
+                          a.agent_id, a.agent_name, a.source_ip, a.dest_ip, a.occurrences
+                   FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
+                   WHERE ia.incident_id = ? AND a.tenant_id = ?
+                   ORDER BY a.last_seen DESC""",
+                (incident_id, tenant_id),
+            ).fetchall()
+            history = connection.execute(
+                """SELECT memory_type, content, created_at FROM incident_memory
+                   WHERE incident_id = ? AND tenant_id = ? ORDER BY created_at DESC""",
+                (incident_id, tenant_id),
+            ).fetchall()
+            return {
+                "incident": self._incident_json(incident),
+                "alerts": [dict(row) for row in alerts],
+                "history": [dict(row) for row in history],
+            }
+
+    def dashboard(self, tenant_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            summary = connection.execute(
+                """SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE WHEN status != 'resolved' THEN 1 ELSE 0 END), 0) AS open,
+                   COALESCE(SUM(CASE WHEN severity IN ('critical', 'high') AND status != 'resolved'
+                       THEN 1 ELSE 0 END), 0) AS priority
+                   FROM incidents WHERE tenant_id = ?""",
+                (tenant_id,),
+            ).fetchone()
+            severities = connection.execute(
+                """SELECT severity, COUNT(*) AS count FROM incidents
+                   WHERE tenant_id = ? AND status != 'resolved' GROUP BY severity""",
+                (tenant_id,),
+            ).fetchall()
+            return {
+                "tenant_id": tenant_id,
+                "incidents": dict(summary),
+                "by_severity": {row["severity"]: row["count"] for row in severities},
+            }
+
+    def update_incident(
+        self, tenant_id: str, incident_id: str, status: str | None, feedback: str | None
+    ) -> dict[str, Any] | None:
+        if status is not None and status not in {"open", "investigating", "resolved", "false_positive"}:
+            raise ValueError("Statut invalide.")
+        with self._connect() as connection:
+            incident = connection.execute(
+                "SELECT * FROM incidents WHERE id = ? AND tenant_id = ?",
+                (incident_id, tenant_id),
+            ).fetchone()
+            if not incident:
+                return None
+            next_status = status or incident["status"]
+            next_feedback = feedback if feedback is not None else incident["feedback"]
+            connection.execute(
+                """UPDATE incidents SET status = ?, feedback = ?, updated_at = ?
+                   WHERE id = ? AND tenant_id = ?""",
+                (next_status, next_feedback, iso_now(), incident_id, tenant_id),
+            )
+            if feedback is not None:
+                connection.execute(
+                    """INSERT INTO incident_memory
+                       (tenant_id, incident_id, memory_type, content, created_at)
+                       VALUES (?, ?, 'feedback', ?, ?)""",
+                    (tenant_id, incident_id, feedback, iso_now()),
+                )
+            updated = connection.execute(
+                "SELECT * FROM incidents WHERE id = ? AND tenant_id = ?",
+                (incident_id, tenant_id),
+            ).fetchone()
+            return self._incident_json(updated)
+
+    def analyze_incident(self, tenant_id: str, incident_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            incident = connection.execute(
+                "SELECT * FROM incidents WHERE id = ? AND tenant_id = ?",
+                (incident_id, tenant_id),
+            ).fetchone()
+            if not incident:
+                return None
+            alerts = connection.execute(
+                """SELECT a.rule_id, a.rule_level, a.description, a.agent_name,
+                          a.source_ip, a.dest_ip, a.occurrences, a.timestamp
+                   FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
+                   WHERE ia.incident_id = ? AND a.tenant_id = ?""",
+                (incident_id, tenant_id),
+            ).fetchall()
+            memories = connection.execute(
+                """SELECT memory_type, content, created_at FROM incident_memory
+                   WHERE incident_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 20""",
+                (incident_id, tenant_id),
+            ).fetchall()
+
+        prompt = {
+            "instruction": (
+                "Analyse ces données SOC défensives. Réponds en français avec: résumé, "
+                "hypothèses à vérifier, actions de triage et recommandations. Distingue "
+                "les faits des hypothèses; n'exécute aucune action."
+            ),
+            "incident": dict(incident),
+            "alerts": [dict(row) for row in alerts],
+            "history_and_feedback": [dict(row) for row in memories],
+        }
+        body = json_response(
+            {
+                "model": self.ollama_model,
+                "prompt": json.dumps(prompt, ensure_ascii=False),
+                "stream": False,
+            }
+        )
+        request = Request(
+            f"{self.ollama_url}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Échec de l'analyse Ollama: {exc}") from exc
+        answer = result.get("response")
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError("Ollama a renvoyé une réponse vide ou invalide.")
+        return {"incident_id": incident_id, "model": self.ollama_model, "analysis": answer}
+
+    def _notify_incident(self, tenant_id: str, incident_id: str, title: str, score: int) -> None:
+        webhook = self.notification_webhooks.get(tenant_id)
+        if not webhook:
+            return
+        request = Request(
+            webhook,
+            data=json_response(
+                {
+                    "tenant_id": tenant_id,
+                    "incident_id": incident_id,
+                    "title": title,
+                    "score": score,
+                    "severity": severity_for(score),
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                if response.status >= 300:
+                    raise RuntimeError(f"Webhook HTTP {response.status}")
+        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
+            LOG.error("Notification en échec pour le client %s: %s", tenant_id, exc)
+            with self._connect() as connection:
+                connection.execute(
+                    """INSERT INTO incident_memory
+                       (tenant_id, incident_id, memory_type, content, created_at)
+                       VALUES (?, ?, 'notification_error', ?, ?)""",
+                    (tenant_id, incident_id, str(exc), iso_now()),
+                )
+
+
+class WazuhCollector:
+    def __init__(self, backend: SocBackend, sources: list[dict[str, Any]], interval: int) -> None:
+        self.backend = backend
+        self.sources = sources
+        self.interval = max(15, interval)
+
+    def run_forever(self) -> None:
+        while True:
+            for source in self.sources:
+                try:
+                    self.collect(source)
+                except (HTTPError, URLError, TimeoutError, ValueError, KeyError, RuntimeError) as exc:
+                    LOG.error("Collecte Wazuh en échec (client %s): %s", source.get("tenant_id"), exc)
+            time.sleep(self.interval)
+
+    @staticmethod
+    def _ssl_context(verify_tls: bool) -> ssl.SSLContext | None:
+        return None if verify_tls else ssl._create_unverified_context()
+
+    def collect(self, source: dict[str, Any]) -> int:
+        tenant_id = str(source["tenant_id"])
+        if tenant_id not in self.backend.tenants.values():
+            raise ValueError(f"Client Wazuh non déclaré dans SOC_TENANTS_JSON: {tenant_id}")
+        base_url = str(source["url"]).rstrip("/")
+        verify_tls = bool(source.get("verify_tls", True))
+        context = self._ssl_context(verify_tls)
+        index_pattern = str(source.get("alerts_index", "wazuh-alerts-*"))
+        if not re.fullmatch(r"[A-Za-z0-9*._-]+", index_pattern):
+            raise ValueError("alerts_index contient des caractères non autorisés.")
+        credentials = base64.b64encode(
+            f"{source['username']}:{source['password']}".encode("utf-8")
+        ).decode("ascii")
+        query = {
+            "size": max(1, min(safe_int(source.get("batch_size"), 100), 1000)),
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "query": {
+                "range": {
+                    "timestamp": {"gte": f"now-{max(self.interval + 60, 120)}s"}
+                }
+            },
+        }
+        alerts_request = Request(
+            f"{base_url}/{index_pattern}/_search",
+            data=json_response(query),
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(alerts_request, timeout=30, context=context) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        hits = result.get("hits") if isinstance(result, dict) else None
+        records = hits.get("hits") if isinstance(hits, dict) else None
+        if not isinstance(records, list):
+            raise ValueError("Réponse Wazuh Indexer inattendue: les résultats hits sont absents.")
+        alerts = []
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Réponse Wazuh Indexer invalide: un résultat n'est pas un objet.")
+            alert = record.get("_source", {})
+            if not isinstance(alert, dict):
+                raise ValueError("Réponse Wazuh Indexer invalide: un document n'a pas _source.")
+            alert.setdefault("id", record.get("_id", ""))
+            alerts.append(alert)
+        for alert in alerts:
+            if isinstance(alert, dict):
+                self.backend.ingest_alert(tenant_id, alert)
+        LOG.info("%s alerte(s) Wazuh indexer importée(s) pour %s", len(alerts), tenant_id)
+        return len(alerts)
+
+
+def create_handler(backend: SocBackend) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "SocBackend/1.0"
+
+        def log_message(self, format_string: str, *args: Any) -> None:
+            LOG.info("%s - %s", self.address_string(), format_string % args)
+
+        def _send(self, status: int, payload: Any) -> None:
+            body = json_response(payload)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("Content-Length invalide.") from exc
+            if length < 0 or length > MAX_REQUEST_BYTES:
+                raise ValueError("Corps de requête trop volumineux.")
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("Le corps doit être un JSON UTF-8 valide.") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("Le corps JSON doit être un objet.")
+            return payload
+
+        def _authenticated_tenant(self) -> str | None:
+            authorization = self.headers.get("Authorization", "")
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not token:
+                return None
+            return backend.tenant_for_token(token.strip())
+
+        def do_GET(self) -> None:
+            path = urlsplit(self.path)
+            if path.path == "/health":
+                self._send(200, {"status": "ok"})
+                return
+            tenant_id = self._authenticated_tenant()
+            if tenant_id is None:
+                self._send(401, {"error": "Authentification Bearer requise."})
+                return
+            params = parse_qs(path.query)
+            try:
+                if path.path == "/api/dashboard":
+                    self._send(200, backend.dashboard(tenant_id))
+                elif path.path == "/api/alerts":
+                    self._send(
+                        200,
+                        {
+                            "items": backend.list_alerts(
+                                tenant_id,
+                                safe_int(params.get("limit", ["100"])[0], 100),
+                                params.get("since", [None])[0],
+                            )
+                        },
+                    )
+                elif path.path == "/api/incidents":
+                    status = params.get("status", [None])[0]
+                    if status and status not in {
+                        "open", "investigating", "resolved", "false_positive"
+                    }:
+                        self._send(400, {"error": "Filtre de statut invalide."})
+                        return
+                    self._send(
+                        200,
+                        {
+                            "items": backend.list_incidents(
+                                tenant_id, status, safe_int(params.get("limit", ["100"])[0], 100)
+                            )
+                        },
+                    )
+                elif re.fullmatch(r"/api/incidents/[0-9a-fA-F-]+", path.path):
+                    incident_id = path.path.rsplit("/", 1)[-1]
+                    result = backend.incident_detail(tenant_id, incident_id)
+                    self._send(200, result) if result else self._send(404, {"error": "Incident introuvable."})
+                else:
+                    self._send(404, {"error": "Route introuvable."})
+            except (sqlite3.Error, ValueError) as exc:
+                LOG.exception("Erreur de lecture API")
+                self._send(500, {"error": str(exc)})
+
+        def do_POST(self) -> None:
+            tenant_id = self._authenticated_tenant()
+            if tenant_id is None:
+                self._send(401, {"error": "Authentification Bearer requise."})
+                return
+            try:
+                payload = self._read_json()
+                if self.path == "/api/alerts":
+                    alert = payload.get("alert", payload)
+                    if not isinstance(alert, dict):
+                        self._send(400, {"error": "'alert' doit être un objet."})
+                        return
+                    result = backend.ingest_alert(tenant_id, alert)
+                    self._send(201 if result["created"] else 200, result)
+                    return
+                match = re.fullmatch(r"/api/incidents/([0-9a-fA-F-]+)/analyze", self.path)
+                if match:
+                    result = backend.analyze_incident(tenant_id, match.group(1))
+                    self._send(200, result) if result else self._send(404, {"error": "Incident introuvable."})
+                    return
+                self._send(404, {"error": "Route introuvable."})
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+            except (sqlite3.Error, RuntimeError) as exc:
+                LOG.exception("Erreur lors du traitement POST")
+                self._send(502 if isinstance(exc, RuntimeError) else 500, {"error": str(exc)})
+
+        def do_PATCH(self) -> None:
+            tenant_id = self._authenticated_tenant()
+            if tenant_id is None:
+                self._send(401, {"error": "Authentification Bearer requise."})
+                return
+            match = re.fullmatch(r"/api/incidents/([0-9a-fA-F-]+)", self.path)
+            if not match:
+                self._send(404, {"error": "Route introuvable."})
+                return
+            try:
+                payload = self._read_json()
+                status = payload.get("status")
+                feedback = payload.get("feedback")
+                if status is not None and not isinstance(status, str):
+                    raise ValueError("'status' doit être une chaîne.")
+                if feedback is not None and not isinstance(feedback, str):
+                    raise ValueError("'feedback' doit être une chaîne.")
+                result = backend.update_incident(tenant_id, match.group(1), status, feedback)
+                self._send(200, result) if result else self._send(404, {"error": "Incident introuvable."})
+            except ValueError as exc:
+                self._send(400, {"error": str(exc)})
+            except sqlite3.Error as exc:
+                LOG.exception("Erreur lors de la mise à jour d'incident")
+                self._send(500, {"error": str(exc)})
+
+    return Handler
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    tenants = parse_json_env("SOC_TENANTS_JSON", {})
+    webhooks = parse_json_env("SOC_WEBHOOKS_JSON", {})
+    sources = parse_json_env("WAZUH_SOURCES_JSON", [])
+    if not isinstance(tenants, dict) or not isinstance(webhooks, dict) or not isinstance(sources, list):
+        raise RuntimeError("SOC_TENANTS_JSON/SOC_WEBHOOKS_JSON doivent être des objets et WAZUH_SOURCES_JSON une liste.")
+    for source in sources:
+        if not isinstance(source, dict) or not {"tenant_id", "url", "username", "password"} <= source.keys():
+            raise RuntimeError(
+                "Chaque source Wazuh doit déclarer tenant_id, url, username et password."
+            )
+    backend = SocBackend(
+        database_path=os.environ.get("SOC_DB_PATH", DEFAULT_DB_PATH),
+        tenants={str(token): str(tenant) for token, tenant in tenants.items()},
+        notification_webhooks={str(tenant): str(url) for tenant, url in webhooks.items()},
+        ollama_url=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
+        ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.1"),
+    )
+
+    if sources:
+        collector = WazuhCollector(
+            backend,
+            sources,
+            safe_int(os.environ.get("WAZUH_POLL_SECONDS"), 60),
+        )
+        threading.Thread(target=collector.run_forever, daemon=True).start()
+
+    host = os.environ.get("SOC_HOST", "127.0.0.1")
+    port = safe_int(os.environ.get("SOC_PORT"), 8080)
+    server = ThreadingHTTPServer((host, port), create_handler(backend))
+    LOG.info("Backend SOC démarré sur http://%s:%s", host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        LOG.info("Arrêt demandé.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
