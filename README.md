@@ -3,7 +3,19 @@
 `script1.py` fournit une API HTTP Python autonome (bibliothèque standard uniquement).
 Elle conserve Wazuh comme source et tableau de bord, sépare les données par client,
 dédoublonne et corrèle les alertes, calcule un score, conserve incidents et retours,
-et peut demander une analyse à une instance Ollama locale.
+et peut demander une analyse à une instance Ollama locale. Les alertes identiques
+(même client, même règle et même agent) sont regroupées pendant 30 minutes, même si
+elles proviennent d'adresses IP différentes. Le compteur et les occurrences par IP
+sont conservés dans le détail de l'alerte et transmis à Ollama.
+
+Les alertes de sévérité `high` ou `critical` déclenchent une analyse Ollama immédiate
+en arrière-plan. Pour les autres niveaux, une répétition de la même alerte dans les
+15 secondes déclenche une analyse agrégée, au plus tôt cinq minutes après la première
+alerte. Une alerte isolée de sévérité faible ou moyenne n'appelle pas automatiquement
+Ollama. L'analyse manuelle via `/api/incidents/{id}/analyze` reste disponible.
+Les analyses automatiques réussies sont ajoutées à l'historique de l'incident. Si
+Ollama est indisponible, le backend réessaie jusqu'à trois fois sans bloquer la
+réception des alertes.
 
 ## Démarrage
 
@@ -31,7 +43,7 @@ sur Internet. Les jetons sont fournis dans l'en-tête `Authorization: Bearer ...
 | `WAZUH_POLL_SECONDS` | `60` | Intervalle minimum de collecte (15 secondes). |
 | `SOC_WEBHOOKS_JSON` | `{}` | Objet JSON `identifiant_client: URL_webhook`. |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | URL de l'instance Ollama recevant le contexte d'incident. |
-| `OLLAMA_MODEL` | `llama3.1` | Modèle Ollama utilisé pour l'analyse à la demande. |
+| `OLLAMA_MODEL` | `llama3.1` | Modèle Ollama utilisé pour les analyses automatiques et manuelles. |
 
 Exemple de collecte via l'API Wazuh Indexer (port 9200 dans une installation standard) :
 
@@ -63,6 +75,7 @@ du client auquel ce jeton est associé.
 
 Les statuts acceptés sont `open`, `investigating`, `resolved` et `false_positive`.
 Les niveaux de sévérité sont calculés automatiquement à partir du niveau Wazuh et
-des occurrences corrélées. La corrélation utilise l'agent ou l'adresse IP source dans
-une fenêtre de 30 minutes; le dédoublonnage regroupe un même événement dans des
-fenêtres de 10 minutes.
+des occurrences corrélées. La corrélation d'incidents utilise l'agent ou l'adresse IP
+source dans une fenêtre de 30 minutes. Le regroupement des alertes est basé sur le
+client, la règle et l'agent, avec une période glissante de 30 minutes; le détail expose
+`occurrences`, `source_ips` et `source_ip_counts`.

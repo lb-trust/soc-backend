@@ -27,6 +27,10 @@ from urllib.request import Request, urlopen
 LOG = logging.getLogger("soc-backend")
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_DB_PATH = "soc.db"
+ALERT_GROUP_WINDOW = timedelta(minutes=30)
+AI_BURST_WINDOW = timedelta(seconds=15)
+AI_BURST_DELAY = timedelta(minutes=5)
+AI_QUEUE_POLL_SECONDS = 1
 
 
 def utc_now() -> datetime:
@@ -150,6 +154,7 @@ class SocBackend:
                     dest_ip TEXT NOT NULL,
                     location TEXT NOT NULL,
                     raw_json TEXT NOT NULL,
+                    source_ip_counts_json TEXT NOT NULL DEFAULT '{}',
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
                     occurrences INTEGER NOT NULL DEFAULT 1,
@@ -186,7 +191,33 @@ class SocBackend:
                 );
                 CREATE INDEX IF NOT EXISTS memory_tenant_created
                     ON incident_memory (tenant_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS incident_ai_queue (
+                    incident_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    first_alert_at TEXT NOT NULL,
+                    burst_started_at TEXT,
+                    due_at TEXT NOT NULL,
+                    burst_confirmed INTEGER NOT NULL DEFAULT 0,
+                    high_priority INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS ai_queue_due
+                    ON incident_ai_queue (status, due_at);
                 """
+            )
+            alert_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(alerts)")
+            }
+            if "source_ip_counts_json" not in alert_columns:
+                connection.execute(
+                    """ALTER TABLE alerts ADD COLUMN source_ip_counts_json
+                       TEXT NOT NULL DEFAULT '{}'"""
+                )
+            connection.execute(
+                """UPDATE incident_ai_queue SET status = 'pending'
+                   WHERE status = 'processing'"""
             )
 
     def tenant_for_token(self, token: str) -> str | None:
@@ -213,21 +244,128 @@ class SocBackend:
         )
         return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _source_ip_counts(
+        counts_json: str, fallback_ip: str, occurrences: int
+    ) -> dict[str, int]:
+        try:
+            counts = json.loads(counts_json)
+        except json.JSONDecodeError:
+            counts = {}
+        if not isinstance(counts, dict):
+            counts = {}
+        normalized = {
+            str(ip): safe_int(count, 0)
+            for ip, count in counts.items()
+            if isinstance(ip, str) and safe_int(count, 0) > 0
+        }
+        if not normalized and fallback_ip:
+            normalized[fallback_ip] = occurrences
+        return normalized
+
+    @staticmethod
+    def _agent_group_clause(event: dict[str, Any]) -> tuple[str, str]:
+        if event["agent_id"]:
+            return "agent_id = ?", event["agent_id"]
+        if event["agent_name"] != "inconnu":
+            return "agent_name = ?", event["agent_name"]
+        return "", ""
+
+    def _schedule_incident_analysis(
+        self,
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        incident: sqlite3.Row,
+        burst_started_at: str | None = None,
+    ) -> None:
+        incident_id = incident["id"]
+        urgent = incident["severity"] in {"high", "critical"}
+        first_alert_at = incident["created_at"]
+        now = iso_now()
+        initial_due = (
+            now if urgent else
+            (datetime.fromisoformat(first_alert_at) + AI_BURST_WINDOW).isoformat(timespec="seconds")
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO incident_ai_queue
+               (incident_id, tenant_id, first_alert_at, due_at, high_priority)
+               VALUES (?, ?, ?, ?, ?)""",
+            (incident_id, tenant_id, first_alert_at, initial_due, int(urgent)),
+        )
+        queued = connection.execute(
+            "SELECT * FROM incident_ai_queue WHERE incident_id = ? AND tenant_id = ?",
+            (incident_id, tenant_id),
+        ).fetchone()
+        if urgent and not queued["high_priority"]:
+            connection.execute(
+                """UPDATE incident_ai_queue
+                   SET high_priority = 1, status = 'pending', due_at = ?, last_error = ''
+                   WHERE incident_id = ? AND tenant_id = ?""",
+                (now, incident_id, tenant_id),
+            )
+        elif burst_started_at and not queued["burst_confirmed"] and not queued["high_priority"]:
+            due_at = (
+                datetime.fromisoformat(burst_started_at) + AI_BURST_DELAY
+            ).isoformat(timespec="seconds")
+            connection.execute(
+                """UPDATE incident_ai_queue SET burst_confirmed = 1,
+                   burst_started_at = ?, due_at = ?, status = 'pending', last_error = ''
+                   WHERE incident_id = ? AND tenant_id = ?""",
+                (burst_started_at, due_at, incident_id, tenant_id),
+            )
+
     def ingest_alert(self, tenant_id: str, raw_alert: dict[str, Any]) -> dict[str, Any]:
         event = normalize_alert(raw_alert)
         now = iso_now()
         dedup_key = self._dedup_key(tenant_id, event)
+        burst_started_at: str | None = None
         with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT * FROM alerts WHERE tenant_id = ? AND dedup_key = ?",
-                (tenant_id, dedup_key),
-            ).fetchone()
+            agent_clause, agent_value = self._agent_group_clause(event)
+            cutoff = (utc_now() - ALERT_GROUP_WINDOW).isoformat(timespec="seconds")
+            existing = None
+            if agent_clause:
+                existing = connection.execute(
+                    f"""SELECT * FROM alerts WHERE tenant_id = ? AND rule_id = ?
+                        AND {agent_clause} AND last_seen >= ?
+                        ORDER BY last_seen DESC LIMIT 1""",
+                    (tenant_id, event["rule_id"], agent_value, cutoff),
+                ).fetchone()
+            if not existing:
+                existing = connection.execute(
+                    """SELECT * FROM alerts WHERE tenant_id = ? AND dedup_key = ?
+                       AND last_seen >= ?
+                       UNION ALL
+                       SELECT * FROM alerts WHERE tenant_id = ? AND dedup_key LIKE ?
+                       AND last_seen >= ? LIMIT 1""",
+                    (
+                        tenant_id, dedup_key, cutoff,
+                        tenant_id, f"{dedup_key}:%", cutoff,
+                    ),
+                ).fetchone()
             if existing:
                 alert_id = existing["id"]
+                source_ip_counts = self._source_ip_counts(
+                    existing["source_ip_counts_json"],
+                    existing["source_ip"],
+                    existing["occurrences"],
+                )
+                if event["source_ip"]:
+                    source_ip_counts[event["source_ip"]] = (
+                        source_ip_counts.get(event["source_ip"], 0) + 1
+                    )
+                first_seen = datetime.fromisoformat(existing["first_seen"])
+                if utc_now() - first_seen <= AI_BURST_WINDOW:
+                    burst_started_at = existing["first_seen"]
                 connection.execute(
                     """UPDATE alerts SET occurrences = occurrences + 1, last_seen = ?,
-                       raw_json = ? WHERE id = ? AND tenant_id = ?""",
-                    (now, json.dumps(raw_alert, ensure_ascii=False), alert_id, tenant_id),
+                       raw_json = ?, source_ip_counts_json = ?,
+                       source_ip = CASE WHEN source_ip = '' THEN ? ELSE source_ip END
+                       WHERE id = ? AND tenant_id = ?""",
+                    (
+                        now, json.dumps(raw_alert, ensure_ascii=False),
+                        json.dumps(source_ip_counts, ensure_ascii=False), event["source_ip"],
+                        alert_id, tenant_id,
+                    ),
                 )
                 linked_incident = connection.execute(
                     """SELECT i.id FROM incidents i
@@ -254,18 +392,27 @@ class SocBackend:
                     )
             else:
                 alert_id = str(uuid.uuid4())
+                stored_dedup_key = dedup_key
+                if connection.execute(
+                    "SELECT 1 FROM alerts WHERE tenant_id = ? AND dedup_key = ?",
+                    (tenant_id, dedup_key),
+                ).fetchone():
+                    stored_dedup_key = f"{dedup_key}:{alert_id}"
                 connection.execute(
                     """INSERT INTO alerts
                        (id, tenant_id, dedup_key, wazuh_id, timestamp, rule_id, rule_level,
                         description, agent_id, agent_name, source_ip, dest_ip, location,
-                        raw_json, first_seen, last_seen)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        raw_json, source_ip_counts_json, first_seen, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        alert_id, tenant_id, dedup_key, event["wazuh_id"], event["timestamp"],
+                        alert_id, tenant_id, stored_dedup_key,
+                        event["wazuh_id"], event["timestamp"],
                         event["rule_id"], event["rule_level"], event["description"],
                         event["agent_id"], event["agent_name"], event["source_ip"],
                         event["dest_ip"], event["location"],
-                        json.dumps(raw_alert, ensure_ascii=False), now, now,
+                        json.dumps(raw_alert, ensure_ascii=False),
+                        json.dumps({event["source_ip"]: 1} if event["source_ip"] else {}),
+                        now, now,
                     ),
                 )
                 self._correlate_alert(connection, tenant_id, alert_id, event, 1)
@@ -278,6 +425,10 @@ class SocBackend:
                    WHERE ia.alert_id = ? AND i.tenant_id = ?""",
                 (alert_id, tenant_id),
             ).fetchone()
+            if incident_row:
+                self._schedule_incident_analysis(
+                    connection, tenant_id, incident_row, burst_started_at
+                )
             return {
                 "alert": self._alert_json(alert_row),
                 "incident": self._incident_json(incident_row) if incident_row else None,
@@ -376,6 +527,13 @@ class SocBackend:
     @staticmethod
     def _alert_json(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
+        counts = SocBackend._source_ip_counts(
+            value.pop("source_ip_counts_json", "{}"),
+            value["source_ip"],
+            value["occurrences"],
+        )
+        value["source_ip_counts"] = counts
+        value["source_ips"] = sorted(counts)
         value["raw"] = json.loads(value.pop("raw_json"))
         return value
 
@@ -419,12 +577,22 @@ class SocBackend:
                 return None
             alerts = connection.execute(
                 """SELECT a.id, a.wazuh_id, a.timestamp, a.rule_id, a.rule_level, a.description,
-                          a.agent_id, a.agent_name, a.source_ip, a.dest_ip, a.occurrences
+                          a.agent_id, a.agent_name, a.source_ip, a.source_ip_counts_json,
+                          a.dest_ip, a.occurrences
                    FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
                    WHERE ia.incident_id = ? AND a.tenant_id = ?
                    ORDER BY a.last_seen DESC""",
                 (incident_id, tenant_id),
             ).fetchall()
+            alert_items = []
+            for row in alerts:
+                item = dict(row)
+                counts = self._source_ip_counts(
+                    item.pop("source_ip_counts_json"), item["source_ip"], item["occurrences"]
+                )
+                item["source_ip_counts"] = counts
+                item["source_ips"] = sorted(counts)
+                alert_items.append(item)
             history = connection.execute(
                 """SELECT memory_type, content, created_at FROM incident_memory
                    WHERE incident_id = ? AND tenant_id = ? ORDER BY created_at DESC""",
@@ -432,7 +600,7 @@ class SocBackend:
             ).fetchall()
             return {
                 "incident": self._incident_json(incident),
-                "alerts": [dict(row) for row in alerts],
+                "alerts": alert_items,
                 "history": [dict(row) for row in history],
             }
 
@@ -499,11 +667,21 @@ class SocBackend:
                 return None
             alerts = connection.execute(
                 """SELECT a.rule_id, a.rule_level, a.description, a.agent_name,
-                          a.source_ip, a.dest_ip, a.occurrences, a.timestamp
+                          a.source_ip, a.source_ip_counts_json, a.dest_ip,
+                          a.occurrences, a.timestamp
                    FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
                    WHERE ia.incident_id = ? AND a.tenant_id = ?""",
                 (incident_id, tenant_id),
             ).fetchall()
+            alert_items = []
+            for row in alerts:
+                item = dict(row)
+                counts = self._source_ip_counts(
+                    item.pop("source_ip_counts_json"), item["source_ip"], item["occurrences"]
+                )
+                item["source_ip_counts"] = counts
+                item["source_ips"] = sorted(counts)
+                alert_items.append(item)
             memories = connection.execute(
                 """SELECT memory_type, content, created_at FROM incident_memory
                    WHERE incident_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 20""",
@@ -514,10 +692,11 @@ class SocBackend:
             "instruction": (
                 "Analyse ces données SOC défensives. Réponds en français avec: résumé, "
                 "hypothèses à vérifier, actions de triage et recommandations. Distingue "
-                "les faits des hypothèses; n'exécute aucune action."
+                "les faits des hypothèses; n'exécute aucune action. Pour les alertes "
+                "agrégées, tiens compte des occurrences et des IP sources distinctes."
             ),
             "incident": dict(incident),
-            "alerts": [dict(row) for row in alerts],
+            "alerts": alert_items,
             "history_and_feedback": [dict(row) for row in memories],
         }
         body = json_response(
@@ -541,7 +720,100 @@ class SocBackend:
         answer = result.get("response")
         if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("Ollama a renvoyé une réponse vide ou invalide.")
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO incident_memory
+                   (tenant_id, incident_id, memory_type, content, created_at)
+                   VALUES (?, ?, 'ai_analysis', ?, ?)""",
+                (tenant_id, incident_id, answer.strip(), iso_now()),
+            )
         return {"incident_id": incident_id, "model": self.ollama_model, "analysis": answer}
+
+    def process_ai_queue(self) -> None:
+        now = iso_now()
+        analyses: list[tuple[str, str]] = []
+        with self._connect() as connection:
+            pending = connection.execute(
+                """SELECT * FROM incident_ai_queue
+                   WHERE status = 'pending' AND due_at <= ? ORDER BY due_at LIMIT 20""",
+                (now,),
+            ).fetchall()
+            for item in pending:
+                if not item["high_priority"] and not item["burst_confirmed"]:
+                    connection.execute(
+                        """UPDATE incident_ai_queue SET status = 'completed'
+                           WHERE incident_id = ? AND tenant_id = ?""",
+                        (item["incident_id"], item["tenant_id"]),
+                    )
+                else:
+                    claimed = connection.execute(
+                        """UPDATE incident_ai_queue SET status = 'processing'
+                           WHERE incident_id = ? AND tenant_id = ? AND status = 'pending'""",
+                        (item["incident_id"], item["tenant_id"]),
+                    )
+                    if claimed.rowcount != 1:
+                        continue
+                    incident_id = item["incident_id"]
+                    tenant_id = item["tenant_id"]
+                    connection.execute(
+                        """INSERT INTO incident_memory
+                           (tenant_id, incident_id, memory_type, content, created_at)
+                           VALUES (?, ?, 'ai_analysis_requested', ?, ?)""",
+                        (
+                            tenant_id, incident_id,
+                            "Analyse automatique prioritaire" if item["high_priority"]
+                            else "Analyse automatique après détection d'une rafale",
+                            now,
+                        ),
+                    )
+                    analyses.append((tenant_id, incident_id))
+        for tenant_id, incident_id in analyses:
+            threading.Thread(
+                target=self._run_queued_analysis,
+                args=(tenant_id, incident_id),
+                daemon=True,
+            ).start()
+
+    def _run_queued_analysis(self, tenant_id: str, incident_id: str) -> None:
+        try:
+            result = self.analyze_incident(tenant_id, incident_id)
+            if result is None:
+                raise RuntimeError("Incident introuvable au moment de l'analyse automatique.")
+        except (RuntimeError, sqlite3.Error) as exc:
+            LOG.error("Analyse automatique en échec pour l'incident %s: %s", incident_id, exc)
+            with self._connect() as connection:
+                item = connection.execute(
+                    """SELECT attempts FROM incident_ai_queue
+                       WHERE incident_id = ? AND tenant_id = ?""",
+                    (incident_id, tenant_id),
+                ).fetchone()
+                if item:
+                    attempts = item["attempts"] + 1
+                    status = "failed" if attempts >= 3 else "pending"
+                    retry_at = (utc_now() + timedelta(minutes=1)).isoformat(timespec="seconds")
+                    connection.execute(
+                        """UPDATE incident_ai_queue SET attempts = ?, status = ?,
+                           due_at = ?, last_error = ?
+                           WHERE incident_id = ? AND tenant_id = ?""",
+                        (
+                            attempts, status, retry_at, str(exc), incident_id, tenant_id,
+                        ),
+                    )
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE incident_ai_queue SET status = 'completed', last_error = ''
+                   WHERE incident_id = ? AND tenant_id = ?""",
+                (incident_id, tenant_id),
+            )
+
+    def run_ai_queue_forever(self) -> None:
+        while True:
+            try:
+                self.process_ai_queue()
+            except sqlite3.Error:
+                LOG.exception("Erreur lors du traitement de la file d'analyses IA")
+            time.sleep(AI_QUEUE_POLL_SECONDS)
 
     def _notify_incident(self, tenant_id: str, incident_id: str, title: str, score: int) -> None:
         webhook = self.notification_webhooks.get(tenant_id)
@@ -812,6 +1084,7 @@ def main() -> None:
         ollama_url=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
         ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.1"),
     )
+    threading.Thread(target=backend.run_ai_queue_forever, daemon=True).start()
 
     if sources:
         collector = WazuhCollector(

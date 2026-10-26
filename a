@@ -1,0 +1,15 @@
+Invoke-RestMethod http://127.0.0.1:8080/health
+
+$headers = @{ Authorization = "Bearer jeton-de-test2" }
+$alerte = @{
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    rule = @{ id = "1011"; level = 13; description = "Alerte de test2" }
+    agent = @{ id = "002"; name = "poste-test" }
+    data = @{ srcip = "192.0.2.10" }
+}
+
+Invoke-RestMethod -Method Post `
+    -Uri http://127.0.0.1:8080/api/alerts `
+    -Headers $headers `
+    -ContentType "application/json" `
+    -Body ($alerte | ConvertTo-Json -Depth 5)
