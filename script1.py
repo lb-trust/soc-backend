@@ -27,10 +27,14 @@ from urllib.request import Request, urlopen
 LOG = logging.getLogger("soc-backend")
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_DB_PATH = "soc.db"
-ALERT_GROUP_WINDOW = timedelta(minutes=30)
-AI_BURST_WINDOW = timedelta(seconds=15)
-AI_BURST_DELAY = timedelta(minutes=5)
+LOW_ALERT_GROUP_WINDOW = timedelta(hours=6)
+HIGH_ALERT_GROUP_WINDOW = timedelta(minutes=30)
+LOW_ALERT_PUBLISH_THRESHOLD = 40
+HIGH_ALERT_LEVEL = 10
 AI_QUEUE_POLL_SECONDS = 1
+AI_RETRY_DELAY = timedelta(minutes=1)
+MAX_AI_ATTEMPTS = 3
+WAZUH_DEDUP_RETENTION = timedelta(days=7)
 
 
 def utc_now() -> datetime:
@@ -111,6 +115,9 @@ class SocBackend:
         notification_webhooks: dict[str, str],
         ollama_url: str,
         ollama_model: str,
+        iris_base_url: str = "",
+        iris_api_key: str = "",
+        iris_case_id: int | None = None,
     ) -> None:
         if not tenants or any(not token or not tenant for token, tenant in tenants.items()):
             raise RuntimeError("Configurez SOC_TENANTS_JSON avec des jetons et identifiants clients.")
@@ -119,6 +126,28 @@ class SocBackend:
         self.notification_webhooks = notification_webhooks
         self.ollama_url = ollama_url.rstrip("/")
         self.ollama_model = ollama_model
+        iris_configured = (iris_base_url, iris_api_key, iris_case_id)
+        if any(iris_configured) and not all(iris_configured):
+            raise RuntimeError(
+                "Configurez ensemble IRIS_BASE_URL, IRIS_API_KEY et IRIS_CASE_ID."
+            )
+        self.iris_base_url = iris_base_url.rstrip("/")
+        self.iris_api_key = iris_api_key
+        self.iris_case_id = iris_case_id
+        if self.iris_api_key:
+            iris_url = urlsplit(self.iris_base_url)
+            if (
+                iris_url.scheme != "https"
+                or not iris_url.hostname
+                or iris_url.username
+                or iris_url.password
+                or iris_url.query
+                or iris_url.fragment
+                or iris_url.path not in {"", "/"}
+            ):
+                raise RuntimeError(
+                    "IRIS_BASE_URL doit être une origine HTTPS sans identifiants ni chemin."
+                )
         self._initialize_database()
 
     @contextmanager
@@ -158,6 +187,7 @@ class SocBackend:
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
                     occurrences INTEGER NOT NULL DEFAULT 1,
+                    occurrences_6h INTEGER NOT NULL DEFAULT 1,
                     UNIQUE (tenant_id, dedup_key)
                 );
                 CREATE INDEX IF NOT EXISTS alerts_tenant_last_seen
@@ -191,20 +221,40 @@ class SocBackend:
                 );
                 CREATE INDEX IF NOT EXISTS memory_tenant_created
                     ON incident_memory (tenant_id, created_at DESC);
-                CREATE TABLE IF NOT EXISTS incident_ai_queue (
-                    incident_id TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS incident_ai_jobs (
+                    job_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
-                    first_alert_at TEXT NOT NULL,
-                    burst_started_at TEXT,
+                    incident_id TEXT NOT NULL,
+                    alert_id TEXT NOT NULL UNIQUE,
                     due_at TEXT NOT NULL,
-                    burst_confirmed INTEGER NOT NULL DEFAULT 0,
-                    high_priority INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT ''
+                    iris_attempts INTEGER NOT NULL DEFAULT 0,
+                    analysis TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS ai_queue_due
-                    ON incident_ai_queue (status, due_at);
+                CREATE INDEX IF NOT EXISTS ai_jobs_due
+                    ON incident_ai_jobs (status, due_at);
+                CREATE TABLE IF NOT EXISTS wazuh_event_dedup (
+                    tenant_id TEXT NOT NULL,
+                    wazuh_id TEXT NOT NULL,
+                    alert_id TEXT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, wazuh_id)
+                );
+                CREATE INDEX IF NOT EXISTS wazuh_event_dedup_created
+                    ON wazuh_event_dedup (created_at);
+                CREATE TABLE IF NOT EXISTS alert_occurrence_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id TEXT NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+                    source_ip TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS alert_occurrences_window
+                    ON alert_occurrence_events (alert_id, created_at);
+                CREATE INDEX IF NOT EXISTS alert_occurrences_created
+                    ON alert_occurrence_events (created_at);
                 """
             )
             alert_columns = {
@@ -215,9 +265,17 @@ class SocBackend:
                     """ALTER TABLE alerts ADD COLUMN source_ip_counts_json
                        TEXT NOT NULL DEFAULT '{}'"""
                 )
+            if "occurrences_6h" not in alert_columns:
+                connection.execute(
+                    """ALTER TABLE alerts ADD COLUMN occurrences_6h
+                       INTEGER NOT NULL DEFAULT 1"""
+                )
             connection.execute(
-                """UPDATE incident_ai_queue SET status = 'pending'
-                   WHERE status = 'processing'"""
+                """UPDATE incident_ai_jobs SET status = CASE status
+                       WHEN 'processing' THEN 'pending'
+                       WHEN 'iris_processing' THEN 'iris_pending'
+                       ELSE status END
+                   WHERE status IN ('processing', 'iris_processing')"""
             )
 
     def tenant_for_token(self, token: str) -> str | None:
@@ -271,57 +329,68 @@ class SocBackend:
             return "agent_name = ?", event["agent_name"]
         return "", ""
 
-    def _schedule_incident_analysis(
+    def _queue_qualified_analysis(
         self,
         connection: sqlite3.Connection,
         tenant_id: str,
-        incident: sqlite3.Row,
-        burst_started_at: str | None = None,
+        incident_id: str,
+        alert_id: str,
+        rule_level: int,
+        occurrences: int,
     ) -> None:
-        incident_id = incident["id"]
-        urgent = incident["severity"] in {"high", "critical"}
-        first_alert_at = incident["created_at"]
+        if rule_level < HIGH_ALERT_LEVEL and occurrences < LOW_ALERT_PUBLISH_THRESHOLD:
+            return
         now = iso_now()
-        initial_due = (
-            now if urgent else
-            (datetime.fromisoformat(first_alert_at) + AI_BURST_WINDOW).isoformat(timespec="seconds")
-        )
         connection.execute(
-            """INSERT OR IGNORE INTO incident_ai_queue
-               (incident_id, tenant_id, first_alert_at, due_at, high_priority)
-               VALUES (?, ?, ?, ?, ?)""",
-            (incident_id, tenant_id, first_alert_at, initial_due, int(urgent)),
+            """INSERT OR IGNORE INTO incident_ai_jobs
+               (job_id, tenant_id, incident_id, alert_id, due_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), tenant_id, incident_id, alert_id, now, now),
         )
-        queued = connection.execute(
-            "SELECT * FROM incident_ai_queue WHERE incident_id = ? AND tenant_id = ?",
-            (incident_id, tenant_id),
-        ).fetchone()
-        if urgent and not queued["high_priority"]:
-            connection.execute(
-                """UPDATE incident_ai_queue
-                   SET high_priority = 1, status = 'pending', due_at = ?, last_error = ''
-                   WHERE incident_id = ? AND tenant_id = ?""",
-                (now, incident_id, tenant_id),
-            )
-        elif burst_started_at and not queued["burst_confirmed"] and not queued["high_priority"]:
-            due_at = (
-                datetime.fromisoformat(burst_started_at) + AI_BURST_DELAY
-            ).isoformat(timespec="seconds")
-            connection.execute(
-                """UPDATE incident_ai_queue SET burst_confirmed = 1,
-                   burst_started_at = ?, due_at = ?, status = 'pending', last_error = ''
-                   WHERE incident_id = ? AND tenant_id = ?""",
-                (burst_started_at, due_at, incident_id, tenant_id),
-            )
 
     def ingest_alert(self, tenant_id: str, raw_alert: dict[str, Any]) -> dict[str, Any]:
         event = normalize_alert(raw_alert)
         now = iso_now()
         dedup_key = self._dedup_key(tenant_id, event)
-        burst_started_at: str | None = None
         with self._connect() as connection:
+            if event["wazuh_id"]:
+                duplicate = connection.execute(
+                    """SELECT a.* FROM wazuh_event_dedup w
+                       JOIN alerts a ON a.id = w.alert_id
+                       WHERE w.tenant_id = ? AND w.wazuh_id = ?""",
+                    (tenant_id, event["wazuh_id"]),
+                ).fetchone()
+                if duplicate:
+                    incident = connection.execute(
+                        """SELECT i.* FROM incidents i JOIN incident_alerts ia
+                           ON ia.incident_id = i.id WHERE ia.alert_id = ?
+                           AND i.tenant_id = ?""",
+                        (duplicate["id"], tenant_id),
+                    ).fetchone()
+                    return {
+                        "alert": self._alert_json(duplicate),
+                        "incident": self._incident_json(incident) if incident else None,
+                        "created": False,
+                    }
+            occurrence_cutoff = (utc_now() - timedelta(hours=6)).isoformat(timespec="seconds")
+            dedup_cutoff = (
+                utc_now() - WAZUH_DEDUP_RETENTION
+            ).isoformat(timespec="seconds")
+            connection.execute(
+                "DELETE FROM alert_occurrence_events WHERE created_at < ?",
+                (occurrence_cutoff,),
+            )
+            connection.execute(
+                "DELETE FROM wazuh_event_dedup WHERE created_at < ?",
+                (dedup_cutoff,),
+            )
             agent_clause, agent_value = self._agent_group_clause(event)
-            cutoff = (utc_now() - ALERT_GROUP_WINDOW).isoformat(timespec="seconds")
+            group_window = (
+                HIGH_ALERT_GROUP_WINDOW
+                if event["rule_level"] >= HIGH_ALERT_LEVEL
+                else LOW_ALERT_GROUP_WINDOW
+            )
+            cutoff = (utc_now() - group_window).isoformat(timespec="seconds")
             existing = None
             if agent_clause:
                 existing = connection.execute(
@@ -344,27 +413,14 @@ class SocBackend:
                 ).fetchone()
             if existing:
                 alert_id = existing["id"]
-                source_ip_counts = self._source_ip_counts(
-                    existing["source_ip_counts_json"],
-                    existing["source_ip"],
-                    existing["occurrences"],
-                )
-                if event["source_ip"]:
-                    source_ip_counts[event["source_ip"]] = (
-                        source_ip_counts.get(event["source_ip"], 0) + 1
-                    )
-                first_seen = datetime.fromisoformat(existing["first_seen"])
-                if utc_now() - first_seen <= AI_BURST_WINDOW:
-                    burst_started_at = existing["first_seen"]
                 connection.execute(
                     """UPDATE alerts SET occurrences = occurrences + 1, last_seen = ?,
-                       raw_json = ?, source_ip_counts_json = ?,
+                       raw_json = ?,
                        source_ip = CASE WHEN source_ip = '' THEN ? ELSE source_ip END
                        WHERE id = ? AND tenant_id = ?""",
                     (
                         now, json.dumps(raw_alert, ensure_ascii=False),
-                        json.dumps(source_ip_counts, ensure_ascii=False), event["source_ip"],
-                        alert_id, tenant_id,
+                        event["source_ip"], alert_id, tenant_id,
                     ),
                 )
                 linked_incident = connection.execute(
@@ -417,6 +473,36 @@ class SocBackend:
                 )
                 self._correlate_alert(connection, tenant_id, alert_id, event, 1)
 
+            connection.execute(
+                """INSERT INTO alert_occurrence_events (alert_id, source_ip, created_at)
+                   VALUES (?, ?, ?)""",
+                (alert_id, event["source_ip"], now),
+            )
+            connection.execute(
+                """DELETE FROM alert_occurrence_events
+                   WHERE alert_id = ? AND created_at < ?""",
+                (alert_id, occurrence_cutoff),
+            )
+            window_ip_rows = connection.execute(
+                """SELECT source_ip, COUNT(*) AS count FROM alert_occurrence_events
+                   WHERE alert_id = ? AND created_at >= ? AND source_ip != ''
+                   GROUP BY source_ip""",
+                (alert_id, occurrence_cutoff),
+            ).fetchall()
+            occurrences_6h = connection.execute(
+                """SELECT COUNT(*) AS count FROM alert_occurrence_events
+                   WHERE alert_id = ? AND created_at >= ?""",
+                (alert_id, occurrence_cutoff),
+            ).fetchone()["count"]
+            source_ip_counts = {row["source_ip"]: row["count"] for row in window_ip_rows}
+            connection.execute(
+                """UPDATE alerts SET occurrences_6h = ?, source_ip_counts_json = ?
+                   WHERE id = ? AND tenant_id = ?""",
+                (
+                    occurrences_6h, json.dumps(source_ip_counts, ensure_ascii=False),
+                    alert_id, tenant_id,
+                ),
+            )
             alert_row = connection.execute(
                 "SELECT * FROM alerts WHERE id = ? AND tenant_id = ?", (alert_id, tenant_id)
             ).fetchone()
@@ -426,8 +512,16 @@ class SocBackend:
                 (alert_id, tenant_id),
             ).fetchone()
             if incident_row:
-                self._schedule_incident_analysis(
-                    connection, tenant_id, incident_row, burst_started_at
+                self._queue_qualified_analysis(
+                    connection, tenant_id, incident_row["id"], alert_id,
+                    event["rule_level"], alert_row["occurrences_6h"],
+                )
+            if event["wazuh_id"]:
+                connection.execute(
+                    """INSERT OR IGNORE INTO wazuh_event_dedup
+                       (tenant_id, wazuh_id, alert_id, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (tenant_id, event["wazuh_id"], alert_id, now),
                 )
             return {
                 "alert": self._alert_json(alert_row),
@@ -578,7 +672,7 @@ class SocBackend:
             alerts = connection.execute(
                 """SELECT a.id, a.wazuh_id, a.timestamp, a.rule_id, a.rule_level, a.description,
                           a.agent_id, a.agent_name, a.source_ip, a.source_ip_counts_json,
-                          a.dest_ip, a.occurrences
+                          a.dest_ip, a.occurrences, a.occurrences_6h
                    FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
                    WHERE ia.incident_id = ? AND a.tenant_id = ?
                    ORDER BY a.last_seen DESC""",
@@ -668,7 +762,7 @@ class SocBackend:
             alerts = connection.execute(
                 """SELECT a.rule_id, a.rule_level, a.description, a.agent_name,
                           a.source_ip, a.source_ip_counts_json, a.dest_ip,
-                          a.occurrences, a.timestamp
+                          a.occurrences, a.occurrences_6h, a.timestamp
                    FROM alerts a JOIN incident_alerts ia ON ia.alert_id = a.id
                    WHERE ia.incident_id = ? AND a.tenant_id = ?""",
                 (incident_id, tenant_id),
@@ -731,50 +825,67 @@ class SocBackend:
 
     def process_ai_queue(self) -> None:
         now = iso_now()
-        analyses: list[tuple[str, str]] = []
+        ai_jobs: list[tuple[str, str, str]] = []
+        iris_jobs: list[tuple[str, str, str, str]] = []
         with self._connect() as connection:
             pending = connection.execute(
-                """SELECT * FROM incident_ai_queue
-                   WHERE status = 'pending' AND due_at <= ? ORDER BY due_at LIMIT 20""",
+                """SELECT * FROM incident_ai_jobs
+                   WHERE status IN ('pending', 'iris_pending') AND due_at <= ?
+                   ORDER BY due_at LIMIT 20""",
                 (now,),
             ).fetchall()
             for item in pending:
-                if not item["high_priority"] and not item["burst_confirmed"]:
-                    connection.execute(
-                        """UPDATE incident_ai_queue SET status = 'completed'
-                           WHERE incident_id = ? AND tenant_id = ?""",
-                        (item["incident_id"], item["tenant_id"]),
-                    )
-                else:
+                if item["status"] == "pending":
                     claimed = connection.execute(
-                        """UPDATE incident_ai_queue SET status = 'processing'
-                           WHERE incident_id = ? AND tenant_id = ? AND status = 'pending'""",
-                        (item["incident_id"], item["tenant_id"]),
+                        """UPDATE incident_ai_jobs SET status = 'processing'
+                           WHERE job_id = ? AND status = 'pending'""",
+                        (item["job_id"],),
                     )
                     if claimed.rowcount != 1:
                         continue
-                    incident_id = item["incident_id"]
-                    tenant_id = item["tenant_id"]
                     connection.execute(
                         """INSERT INTO incident_memory
                            (tenant_id, incident_id, memory_type, content, created_at)
                            VALUES (?, ?, 'ai_analysis_requested', ?, ?)""",
                         (
-                            tenant_id, incident_id,
-                            "Analyse automatique prioritaire" if item["high_priority"]
-                            else "Analyse automatique après détection d'une rafale",
+                            item["tenant_id"], item["incident_id"],
+                            "Analyse automatique après seuil de pertinence atteint",
                             now,
                         ),
                     )
-                    analyses.append((tenant_id, incident_id))
-        for tenant_id, incident_id in analyses:
+                    ai_jobs.append(
+                        (item["job_id"], item["tenant_id"], item["incident_id"])
+                    )
+                else:
+                    claimed = connection.execute(
+                        """UPDATE incident_ai_jobs SET status = 'iris_processing'
+                           WHERE job_id = ? AND status = 'iris_pending'""",
+                        (item["job_id"],),
+                    )
+                    if claimed.rowcount != 1:
+                        continue
+                    iris_jobs.append(
+                        (
+                            item["job_id"], item["tenant_id"], item["incident_id"],
+                            item["analysis"],
+                        )
+                    )
+        for job_id, tenant_id, incident_id in ai_jobs:
             threading.Thread(
                 target=self._run_queued_analysis,
-                args=(tenant_id, incident_id),
+                args=(job_id, tenant_id, incident_id),
+                daemon=True,
+            ).start()
+        for job_id, tenant_id, incident_id, analysis in iris_jobs:
+            threading.Thread(
+                target=self._run_queued_iris_publish,
+                args=(job_id, tenant_id, incident_id, analysis),
                 daemon=True,
             ).start()
 
-    def _run_queued_analysis(self, tenant_id: str, incident_id: str) -> None:
+    def _run_queued_analysis(
+        self, job_id: str, tenant_id: str, incident_id: str
+    ) -> None:
         try:
             result = self.analyze_incident(tenant_id, incident_id)
             if result is None:
@@ -783,28 +894,129 @@ class SocBackend:
             LOG.error("Analyse automatique en échec pour l'incident %s: %s", incident_id, exc)
             with self._connect() as connection:
                 item = connection.execute(
-                    """SELECT attempts FROM incident_ai_queue
-                       WHERE incident_id = ? AND tenant_id = ?""",
-                    (incident_id, tenant_id),
+                    "SELECT attempts FROM incident_ai_jobs WHERE job_id = ?",
+                    (job_id,),
                 ).fetchone()
                 if item:
                     attempts = item["attempts"] + 1
-                    status = "failed" if attempts >= 3 else "pending"
-                    retry_at = (utc_now() + timedelta(minutes=1)).isoformat(timespec="seconds")
+                    status = "failed" if attempts >= MAX_AI_ATTEMPTS else "pending"
+                    retry_at = (utc_now() + AI_RETRY_DELAY).isoformat(timespec="seconds")
                     connection.execute(
-                        """UPDATE incident_ai_queue SET attempts = ?, status = ?,
-                           due_at = ?, last_error = ?
-                           WHERE incident_id = ? AND tenant_id = ?""",
+                        """UPDATE incident_ai_jobs SET attempts = ?, status = ?,
+                           due_at = ?, last_error = ? WHERE job_id = ?""",
                         (
-                            attempts, status, retry_at, str(exc), incident_id, tenant_id,
+                            attempts, status, retry_at, str(exc), job_id,
                         ),
+                    )
+            return
+        analysis = result["analysis"]
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE incident_ai_jobs SET status = ?, analysis = ?, due_at = ?,
+                   last_error = '' WHERE job_id = ?""",
+                (
+                    "iris_processing" if self.iris_api_key else "completed",
+                    analysis, iso_now(), job_id,
+                ),
+            )
+        if self.iris_api_key:
+            self._run_queued_iris_publish(job_id, tenant_id, incident_id, analysis)
+
+    def _publish_iris_event(
+        self, job_id: str, tenant_id: str, incident_id: str, analysis: str
+    ) -> None:
+        if not self.iris_base_url or not self.iris_api_key or self.iris_case_id is None:
+            raise RuntimeError("La publication IRIS est activée sans configuration complète.")
+        detail = self.incident_detail(tenant_id, incident_id)
+        if detail is None:
+            raise RuntimeError("Incident introuvable lors de la publication vers IRIS.")
+        payload = {
+            "event_title": f"Analyse SOC: {detail['incident']['title'][:200]}",
+            "event_in_graph": True,
+            "event_in_summary": True,
+            "event_content": analysis,
+            "event_raw": json.dumps(
+                {
+                    "soc_job_id": job_id,
+                    "incident": detail["incident"],
+                    "alerts": detail["alerts"],
+                    "analysis": analysis,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "event_source": "SOC Backend / Ollama",
+            "event_assets": [],
+            "event_iocs": [],
+            "event_category_id": "1",
+            "event_color": "",
+            "event_date": utc_now().strftime("%Y-%m-%dT%H:%M:%S.%f"),
+            "event_tags": "SOC,Wazuh,Ollama",
+            "event_tz": "+00:00",
+            "custom_attributes": {},
+            "event_sync_iocs_assets": False,
+            "cid": self.iris_case_id,
+        }
+        request = Request(
+            f"{self.iris_base_url}/case/timeline/events/add",
+            data=json_response(payload),
+            headers={
+                "Authorization": f"Bearer {self.iris_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (
+            HTTPError, URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError
+        ) as exc:
+            raise RuntimeError(f"Échec de publication dans IRIS DFIR: {exc}") from exc
+        if (
+            not isinstance(result, dict)
+            or result.get("success") is False
+            or str(result.get("status", "")).lower() in {"error", "failed", "failure"}
+        ):
+            raise RuntimeError("IRIS DFIR a renvoyé une réponse invalide.")
+
+    def _run_queued_iris_publish(
+        self, job_id: str, tenant_id: str, incident_id: str, analysis: str
+    ) -> None:
+        try:
+            self._publish_iris_event(job_id, tenant_id, incident_id, analysis)
+        except (RuntimeError, sqlite3.Error) as exc:
+            LOG.error("Publication IRIS échouée pour l'incident %s: %s", incident_id, exc)
+            with self._connect() as connection:
+                item = connection.execute(
+                    "SELECT iris_attempts FROM incident_ai_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if item:
+                    attempts = item["iris_attempts"] + 1
+                    status = "failed" if attempts >= MAX_AI_ATTEMPTS else "iris_pending"
+                    retry_at = (utc_now() + AI_RETRY_DELAY).isoformat(timespec="seconds")
+                    connection.execute(
+                        """UPDATE incident_ai_jobs SET iris_attempts = ?, status = ?,
+                           due_at = ?, last_error = ? WHERE job_id = ?""",
+                        (attempts, status, retry_at, str(exc), job_id),
                     )
             return
         with self._connect() as connection:
             connection.execute(
-                """UPDATE incident_ai_queue SET status = 'completed', last_error = ''
-                   WHERE incident_id = ? AND tenant_id = ?""",
-                (incident_id, tenant_id),
+                """UPDATE incident_ai_jobs SET status = 'completed', last_error = ''
+                   WHERE job_id = ?""",
+                (job_id,),
+            )
+            connection.execute(
+                """INSERT INTO incident_memory
+                   (tenant_id, incident_id, memory_type, content, created_at)
+                   VALUES (?, ?, 'iris_published', ?, ?)""",
+                (
+                    tenant_id, incident_id,
+                    f"Analyse Ollama publiée dans le cas IRIS {self.iris_case_id}",
+                    iso_now(),
+                ),
             )
 
     def run_ai_queue_forever(self) -> None:
@@ -1077,12 +1289,19 @@ def main() -> None:
             raise RuntimeError(
                 "Chaque source Wazuh doit déclarer tenant_id, url, username et password."
             )
+    iris_case_id_raw = os.environ.get("IRIS_CASE_ID", "").strip()
+    iris_case_id = safe_int(iris_case_id_raw, -1) if iris_case_id_raw else None
+    if iris_case_id is not None and iris_case_id <= 0:
+        raise RuntimeError("IRIS_CASE_ID doit être un entier positif.")
     backend = SocBackend(
         database_path=os.environ.get("SOC_DB_PATH", DEFAULT_DB_PATH),
         tenants={str(token): str(tenant) for token, tenant in tenants.items()},
         notification_webhooks={str(tenant): str(url) for tenant, url in webhooks.items()},
         ollama_url=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"),
         ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.1"),
+        iris_base_url=os.environ.get("IRIS_BASE_URL", "").strip(),
+        iris_api_key=os.environ.get("IRIS_API_KEY", "").strip(),
+        iris_case_id=iris_case_id,
     )
     threading.Thread(target=backend.run_ai_queue_forever, daemon=True).start()
 

@@ -4,18 +4,24 @@
 Elle conserve Wazuh comme source et tableau de bord, sépare les données par client,
 dédoublonne et corrèle les alertes, calcule un score, conserve incidents et retours,
 et peut demander une analyse à une instance Ollama locale. Les alertes identiques
-(même client, même règle et même agent) sont regroupées pendant 30 minutes, même si
-elles proviennent d'adresses IP différentes. Le compteur et les occurrences par IP
-sont conservés dans le détail de l'alerte et transmis à Ollama.
+(même client, même règle et même agent) sont regroupées, toutes IP sources confondues.
+Les alertes de niveau inférieur à 10 sont regroupées pendant six heures et ne
+déclenchent Ollama qu'à partir de 40 occurrences distinctes dans cette fenêtre.
+Les alertes de niveau 10 ou plus sont analysées immédiatement. Les identifiants
+Wazuh déjà collectés sont dédupliqués pour éviter qu'un chevauchement de collecte
+gonfle artificiellement le compteur.
 
-Les alertes de sévérité `high` ou `critical` déclenchent une analyse Ollama immédiate
-en arrière-plan. Pour les autres niveaux, une répétition de la même alerte dans les
-15 secondes déclenche une analyse agrégée, au plus tôt cinq minutes après la première
-alerte. Une alerte isolée de sévérité faible ou moyenne n'appelle pas automatiquement
-Ollama. L'analyse manuelle via `/api/incidents/{id}/analyze` reste disponible.
-Les analyses automatiques réussies sont ajoutées à l'historique de l'incident. Si
-Ollama est indisponible, le backend réessaie jusqu'à trois fois sans bloquer la
-réception des alertes.
+Après une analyse automatique Ollama réussie, le backend peut publier un événement
+détaillé dans la timeline d'un cas IRIS DFIR existant. Les alertes ne sont donc jamais
+envoyées directement à IRIS : seules les alertes répondant aux règles ci-dessus sont
+analysées puis publiées. L'événement IRIS contient l'analyse Ollama dans le résumé et
+les données enrichies (compteurs, IP sources, alertes associées) dans les détails.
+L'intégration IRIS reste désactivée tant que `IRIS_BASE_URL`, `IRIS_API_KEY` et
+`IRIS_CASE_ID` ne sont pas tous configurés.
+
+L'analyse manuelle via `/api/incidents/{id}/analyze` reste disponible, mais ne publie
+pas automatiquement dans IRIS. Les analyses automatiques et publications échouées
+sont réessayées jusqu'à trois fois sans bloquer la réception des alertes.
 
 ## Démarrage
 
@@ -44,6 +50,9 @@ sur Internet. Les jetons sont fournis dans l'en-tête `Authorization: Bearer ...
 | `SOC_WEBHOOKS_JSON` | `{}` | Objet JSON `identifiant_client: URL_webhook`. |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | URL de l'instance Ollama recevant le contexte d'incident. |
 | `OLLAMA_MODEL` | `llama3.1` | Modèle Ollama utilisé pour les analyses automatiques et manuelles. |
+| `IRIS_BASE_URL` | désactivé | URL HTTPS de l'instance IRIS DFIR, sans slash final. |
+| `IRIS_API_KEY` | désactivé | Clé API IRIS, fournie dans l'en-tête Bearer et jamais journalisée. |
+| `IRIS_CASE_ID` | désactivé | Identifiant numérique du cas IRIS recevant les événements de timeline. |
 
 Exemple de collecte via l'API Wazuh Indexer (port 9200 dans une installation standard) :
 
@@ -74,8 +83,23 @@ du client auquel ce jeton est associé.
 | `POST /api/incidents/{id}/analyze` | Analyse contextuelle par Ollama. |
 
 Les statuts acceptés sont `open`, `investigating`, `resolved` et `false_positive`.
-Les niveaux de sévérité sont calculés automatiquement à partir du niveau Wazuh et
-des occurrences corrélées. La corrélation d'incidents utilise l'agent ou l'adresse IP
-source dans une fenêtre de 30 minutes. Le regroupement des alertes est basé sur le
-client, la règle et l'agent, avec une période glissante de 30 minutes; le détail expose
-`occurrences`, `source_ips` et `source_ip_counts`.
+Les niveaux de sévérité des incidents sont calculés automatiquement à partir du niveau
+Wazuh et des occurrences corrélées. La corrélation d'incidents utilise l'agent ou
+l'adresse IP source dans une fenêtre de 30 minutes. Le regroupement des alertes est
+basé sur le client, la règle et l'agent : fenêtre glissante de six heures pour les
+niveaux Wazuh inférieurs à 10, et de 30 minutes à partir du niveau 10. Le détail expose
+`occurrences` (total du groupe), `occurrences_6h` (compteur glissant utilisé pour le
+seuil), `source_ips` et `source_ip_counts` (IP distinctes et compteurs sur six heures).
+
+Pour IRIS DFIR, le compte de service doit pouvoir écrire des événements de timeline
+dans le cas cible. Configurez la nouvelle clé API localement, par exemple dans
+PowerShell, sans la placer dans un fichier versionné :
+
+```powershell
+$env:IRIS_BASE_URL='https://adresse-de-votre-iris:8443'
+$env:IRIS_API_KEY='clé-api-stockée-localement'
+$env:IRIS_CASE_ID='123'
+```
+
+Faites confiance au certificat TLS de l'instance IRIS dans le système hôte ; la
+vérification TLS est activée et n'est pas désactivée par le backend.
