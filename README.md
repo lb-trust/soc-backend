@@ -1,6 +1,8 @@
 # Backend SOC augmenté 
 
 `script1.py` fournit une API HTTP Python autonome (bibliothèque standard uniquement).
+Pour relier le backend installé sur une VM à Wazuh et IRIS DFIR sur des VM séparées,
+consultez le [guide d'intégration des VM](./GUIDE-INTEGRATION-VM.md).
 Elle conserve Wazuh comme source et tableau de bord, sépare les données par client,
 dédoublonne et corrèle les alertes, calcule un score, conserve incidents et retours,
 et peut demander une analyse à une instance Ollama locale. Les alertes identiques
